@@ -1,0 +1,479 @@
+#!/usr/bin/python3
+#
+# Copyright 2023 Jonathan McDowell <noodles@earth.li>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS”
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+import base64
+import getpass
+import hashlib
+import time
+import logging
+import sys
+
+import click
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import (
+        decode_dss_signature,
+        encode_dss_signature,
+        Prehashed)
+from fido2.client import Fido2Client, UserInteraction
+from fido2.hid import CtapHidDevice
+from fido2.server import Fido2Server
+from fido2.utils import int2bytes, sha256
+
+class CliInteraction(UserInteraction):
+    """ Handles requesting user interaction when working with FIDO2 key """
+    def prompt_up(self):
+        print("\nTouch your authenticator device now...\n")
+
+    def request_pin(self, permissions, rp_id):
+        return getpass.getpass("Enter PIN: ")
+
+    def request_uv(self, permissions, rp_id):
+        print("User Verification required.")
+        return True
+
+class HashWrapper():
+    """
+    A simple wrapper object around a SHA256 hash to provide it in a manner
+    suitable for use with FIDO2 do_get_assertion
+    """
+    def __init__(self, h) -> None:
+        self._hash = h
+
+    @property
+    def hash(self) -> bytes:
+        """ Returns the SHA256 hash as bytes """
+        return self._hash
+
+    @property
+    def type(self) -> str:
+        """ Returns an indication that we're for use in signature creation """
+        return "webauthn.get"
+
+
+# Override RP verification
+def _allow_client_rp_id(*_: str) -> bool:
+    return True
+
+def _allow_server_rp_id(_: str) -> bool:
+    return True
+
+def get_fido2_client(rp: str) -> Fido2Client:
+    """ Retrieves a FIDO2 client for the first found FIDO2 device """
+    dev = next(CtapHidDevice.list_devices(), None)
+    if dev is None:
+        print("Could not find security key device")
+        sys.exit(1)
+
+    return Fido2Client(dev, rp,
+                         user_interaction=CliInteraction(),
+                         verify=_allow_client_rp_id)
+
+
+def generate_signature(client: Fido2Client, data_hash: bytes,
+                       rp: str, handle: bytes) -> bytes:
+    """
+    Generates a signature over the data hash using client, rp + handle to refer
+    to the appropriate FIDO2 key credentials.
+
+    Returns an OpenPGP structured set of bytes comprising the MPIs r + s, the
+    flag byte and the counter value.
+    """
+
+    print("Generating signature")
+    # We need to go to the backend directly, because python-fido2 will otherwise
+    # make us a webauthn signature.
+    result = client._backend.do_get_assertion(
+            HashWrapper(data_hash),
+            rp,
+            [{"type": "public-key", "id": handle}],
+            extensions=None,
+            user_verification="discouraged",
+            event=None)
+    result = result.get_assertions()[0]
+
+    sig = decode_dss_signature(result.signature)
+
+    mpi = int2bytes(sig[0], 1)
+    bits = mpi[0].bit_length() + (len(mpi) - 1) * 8
+    signature = int2bytes(bits, 2) + mpi
+
+    mpi = int2bytes(sig[1], 1)
+    bits = mpi[0].bit_length() + (len(mpi) - 1) * 8
+    signature += int2bytes(bits, 2) + mpi
+
+    signature += int2bytes(result.auth_data.flags, 1)
+    signature += int2bytes(result.auth_data.counter, 4)
+
+    return signature
+
+
+def read_packet(file: str) -> (int, bytes):
+    """ Reads an OpenPGP packet from a file """
+
+    with open(file, 'rb') as f:
+        data = f.read(1)
+        if data[0] & 0x80 != 0x80:
+            print("Unexpected packet start:", data)
+            sys.exit(1)
+        if data[0] & 0x40 != 0x40:
+            print("We only understand new format packets")
+            sys.exit(1)
+
+        tag = data[0] & 0x3F
+
+        data = f.read(1)
+        length = data[0]
+        if data[0] > 223:
+            print("Unsupported length type")
+            sys.exit(1)
+        if data[0] > 191:
+            data = f.read(1)
+            length = ((length - 192) << 8) + data[0] + 192
+
+        packet = f.read(length)
+
+        return tag, packet
+
+
+@click.group()
+@click.version_option("0.1")
+def cli():
+    """py-fido2-openpgp is a simple tool for using FIDO2 security keys with
+    OpenPGP.
+
+    It can generate a new FIDO2 backed signature key, and create + verify
+    detached signatures for binaries.
+    """
+
+
+@cli.command()
+@click.option("--rp", default="openpgp:", help="Set the 'relying party' information for the key")
+@click.option("--uid", prompt=True, help="A name + email address to add to the key")
+@click.option("--pubkey", default="fido2-pub.pgp", help="Filename to store public key in")
+@click.option("--seckey", default="fido2-sec.pgp", help="Filename to store secret key in")
+def genkey(rp, uid, pubkey, seckey: str):
+    """Creates a new FIDO2 backed key
+    """
+
+    client = get_fido2_client(rp)
+    server = Fido2Server({"id": rp, "name": "OpenPGP"}, attestation="direct",
+                         verify_origin=_allow_server_rp_id)
+
+    user = { "id": b"user_id", "name": "OpenPGP" }
+    # Prepare parameters for makeCredential
+    create_options, state = server.register_begin(
+        user, user_verification="discouraged", authenticator_attachment="cross-platform"
+    )
+
+    print(create_options)
+
+    print("Generating key")
+    result = client.make_credential(create_options["publicKey"])
+    auth_data = server.register_complete(
+            state, result.client_data, result.attestation_object
+    )
+
+    # Build public key
+    key = b'\x04'
+    key += auth_data.credential_data.public_key[-2]
+    key += auth_data.credential_data.public_key[-3]
+
+    timestamp = int(time.time())
+
+    # Build the public key packet
+    packet = b'\x04'
+    packet += int2bytes(timestamp, 4)
+    packet += b'\x1d' # SK-ECDSA
+    packet += b'\x08\x2a\x86\x48\xce\x3d\x03\x01\x07' # nistp256 OID
+    packet += b'\x02\x03' # MPI bit count
+    packet += key
+    packet += int2bytes(len(rp), 1) + bytes(rp, 'utf-8')
+
+    # Build the secret key
+    secpkt = packet
+    # Not encrypted
+    secpkt += b'\x00'
+    mpis = auth_data.credential_data.credential_id
+    bits = mpis[0].bit_length() + (len(mpis) - 1) * 8
+    mpis = int2bytes(bits, 2) + mpis
+    # Flags
+    mpis += b'\x01'
+    # Checksum
+    chk = 0
+    for i in mpis:
+        chk += i
+    chk = chk % 0x10000
+    secpkt += mpis
+    secpkt += int2bytes(chk, 2)
+    secpkt = b'\xC5' + int2bytes(len(secpkt), 1) + secpkt
+
+    packet = b'\xC6' + int2bytes(len(packet), 1) + packet
+    packets = [packet]
+
+    m = hashlib.sha1()
+    m.update(b'\x99\x00' + packet[1:])
+    fingerprint = m.digest()
+
+    # Build the UID packet
+    uid_bytes = bytes(uid, 'utf-8')
+    if len(uid_bytes) > 191:
+        raise Exception("UID too long")
+    packet = b'\xCD' + int2bytes(len(uid_bytes), 1) + uid_bytes
+    packets.append(packet)
+
+    # Build the signature packet
+    packet = b'\x04\x13\x1d\x08'
+    packet += b'\x00\x06'
+    # Creation timestamp (hashed)
+    packet += b'\x05\x02' + int2bytes(timestamp, 4)
+
+    # Binding signature data
+    sigdata = b'\x99\x00'
+    sigdata += packets[0][1:]
+    sigdata += b'\xB4' + int2bytes(len(uid_bytes), 4) + uid_bytes
+    sigdata += packet
+    sigdata += b'\x04\xFF' + int2bytes(len(packet), 4)
+
+    print("Signature hash over: ", base64.b64encode(sigdata))
+
+    sigobj = sha256(sigdata)
+
+    # Signature key ID (unhashed)
+    packet += b'\x00\x0a'
+    packet += b'\x09\x10' + fingerprint[12:]
+
+    packet += sigobj[0:2]
+
+    packet += generate_signature(client, sigobj, rp,
+                                 auth_data.credential_data.credential_id)
+
+    packet = b'\xC2' + int2bytes(len(packet), 1) + packet
+
+    packets.append(packet)
+
+    print()
+    print("Generated key with fingerprint:", m.hexdigest())
+    with open(pubkey, "wb") as f:
+        for packet in packets:
+            f.write(packet)
+
+    with open(seckey, "wb") as f:
+        f.write(secpkt)
+
+
+@cli.command()
+@click.option("--file", required=bool, help="File to sign")
+@click.option("--output", required=bool, help="File to store signature in")
+@click.option("--seckey", default="fido2-sec.pgp", help="File to read secret key from")
+def sign(file, output, seckey: str):
+    """Reads a file and produces a detached signature over it
+    """
+
+    # Build the SHA256 hash of the file
+    hasher = hashlib.sha256()
+    with open(file, 'rb') as f:
+        while True:
+            data = f.read(4096)
+            if not data:
+                break
+            hasher.update(data)
+
+    # Read the secret key data
+    tag, packet = read_packet(seckey)
+
+    if tag != 5:
+        print("Got wrong tag for secret key:", tag)
+        sys.exit(1)
+
+    if packet[0] != 4:
+        print("We only understand v4 keys")
+        sys.exit(1)
+    if packet[5] != 0x1D:
+        print("We only understand SK-ECDSA keys")
+        sys.exit(1)
+    if packet[6] != 8:
+        print("OID is wrong length")
+        sys.exit(1)
+
+    ofs = 17
+    publickey = packet[ofs:ofs+65]
+    ofs += 65
+    rp_len = packet[ofs]
+    ofs += 1
+    rp = packet[ofs:ofs+rp_len].decode('utf-8')
+    ofs += rp_len
+    m = hashlib.sha1()
+    m.update(b'\x99' + ofs.to_bytes(2, 'big') + packet[:ofs])
+    fingerprint = m.digest()
+    ofs += 1
+    handle_len = int(((packet[ofs] << 8) + packet[ofs+1] + 7)/8)
+    ofs += 2
+    handle = packet[ofs:ofs+handle_len]
+
+    timestamp = int(time.time())
+
+    # Build the signature packet
+    packet = b'\x04\x00\x1d\x08'
+    packet += b'\x00\x06'
+    # Creation timestamp (hashed)
+    packet += b'\x05\x02' + int2bytes(timestamp, 4)
+
+    # Binding signature data
+    sigdata = packet
+    sigdata += b'\x04\xFF' + int2bytes(len(packet), 4)
+
+    hasher.update(sigdata)
+    sigobj = hasher.digest()
+
+    # Signature key ID (unhashed)
+    packet += b'\x00\x0a'
+    packet += b'\x09\x10' + fingerprint[12:]
+    packet += sigobj[0:2]
+
+    client = get_fido2_client(rp)
+    packet += generate_signature(client, sigobj, rp, handle)
+
+    packet = b'\xC2' + int2bytes(len(packet), 1) + packet
+
+    with open(output, "wb") as f:
+        f.write(packet)
+
+
+@cli.command()
+@click.option("--file", required=bool, help="File to verify signature on")
+@click.option("--signature", required=bool, help="File to read signature from")
+@click.option("--pubkey", default="fido2-pub.pgp", help="File to read public key from")
+def verify(file, signature, pubkey: str):
+    """Reads a file and verifies the signature on it
+    """
+
+    # Read the public key data
+    tag, packet = read_packet(pubkey)
+
+    if tag != 6:
+        print("Got wrong tag for public key:", tag)
+        sys.exit(1)
+
+    if packet[0] != 4:
+        print("We only understand v4 keys")
+        sys.exit(1)
+    if packet[5] != 0x1D:
+        print("We only understand SK-ECDSA keys")
+        sys.exit(1)
+    if packet[6] != 8:
+        print("OID is wrong length")
+        sys.exit(1)
+
+    ofs = 17
+    publickey = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(),
+                                                             packet[ofs:ofs+65])
+    ofs += 65
+    rp_len = packet[ofs]
+    ofs += 1
+    rp = packet[ofs:ofs+rp_len].decode('utf-8')
+    ofs += rp_len
+    m = hashlib.sha1()
+    m.update(b'\x99' + ofs.to_bytes(2, 'big') + packet[:ofs])
+    fingerprint = m.hexdigest()
+
+    # Read the signature
+    tag, packet = read_packet(signature)
+    if tag != 2:
+        print("Got wrong tag for signature:", tag)
+        sys.exit(1)
+
+    if packet[0] != 4:
+        print("We only understand v4 keys")
+        sys.exit(1)
+
+    if packet[1] != 0:
+        print("We can only verify signatures over binary data")
+        sys.exit(1)
+
+    if packet[2] != 0x1D:
+        print("We can only verify signatures from SK-ECDSA keys")
+        sys.exit(1)
+
+    if packet[3] != 8:
+        print("We can only verify signatures using SHA-256")
+        sys.exit(1)
+
+    length = (packet[4] << 8) + packet[5] + 6
+
+    # Build the SHA256 hash of the file
+    hasher = hashlib.sha256()
+    with open(file, 'rb') as f:
+        while True:
+            data = f.read(4096)
+            if not data:
+                break
+            hasher.update(data)
+
+    hasher.update(packet[:length] + b'\x04\xFF' + int2bytes(length, 4))
+
+    # Skip unhashed signature data
+    length += (packet[length] << 8) + packet[length + 1] + 4
+
+    # Parse the r + s MPIs into an ASN.1 DER signature
+    mpi_len = int(((packet[length] << 8) + packet[length + 1] + 7) / 8)
+    length += 2
+    sig_r = int.from_bytes(packet[length:length+mpi_len], "big")
+    length += mpi_len
+    mpi_len = int(((packet[length] << 8) + packet[length + 1] + 7) / 8)
+    length += 2
+    sig_s = int.from_bytes(packet[length:length+mpi_len], "big")
+    length += mpi_len
+
+    sig = encode_dss_signature(sig_r, sig_s)
+
+    # Build the FIDO2 signature
+    # SHA256(RP) + flags + counter + SHA256(data)
+    fido2_data = sha256(rp.encode('utf-8'))
+    fido2_data += packet[length:length+5]
+    fido2_data += hasher.digest()
+
+    sig_ok = False
+    try:
+        publickey.verify(sig,
+                         sha256(fido2_data),
+                         ec.ECDSA(Prehashed(hashes.SHA256())))
+        sig_ok = True
+    except InvalidSignature:
+        pass
+
+    if sig_ok:
+        print("GOOD signature from", fingerprint)
+    else:
+        print("BAD signature from", fingerprint)
+
+
+if __name__ == '__main__':
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    cli()
