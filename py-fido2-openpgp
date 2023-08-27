@@ -209,8 +209,7 @@ def genkey(rp, uid, pubkey, seckey: str):
     # Build the public key packet
     packet = b'\x04'
     packet += int2bytes(timestamp, 4)
-    packet += b'\x1d' # SK-ECDSA
-    packet += b'\x08\x2a\x86\x48\xce\x3d\x03\x01\x07' # nistp256 OID
+    packet += b'\x2b' # SK-NISTP256
     packet += b'\x02\x03' # MPI bit count
     packet += key
     packet += int2bytes(len(rp), 1) + bytes(rp, 'utf-8')
@@ -222,7 +221,7 @@ def genkey(rp, uid, pubkey, seckey: str):
     mpis = auth_data.credential_data.credential_id
     bits = mpis[0].bit_length() + (len(mpis) - 1) * 8
     mpis = int2bytes(bits, 2) + mpis
-    # Flags
+    # Flags (User Presence set)
     mpis += b'\x01'
     # Checksum
     chk = 0
@@ -248,7 +247,7 @@ def genkey(rp, uid, pubkey, seckey: str):
     packets.append(packet)
 
     # Build the signature packet
-    packet = b'\x04\x13\x1d\x08'
+    packet = b'\x04\x13\x2b\x08'
     packet += b'\x00\x06'
     # Creation timestamp (hashed)
     packet += b'\x05\x02' + int2bytes(timestamp, 4)
@@ -314,14 +313,11 @@ def sign(file, output, seckey: str):
     if packet[0] != 4:
         print("We only understand v4 keys")
         sys.exit(1)
-    if packet[5] != 0x1D:
-        print("We only understand SK-ECDSA keys")
-        sys.exit(1)
-    if packet[6] != 8:
-        print("OID is wrong length")
+    if packet[5] != 43:
+        print("We only understand SK-NISTP256 keys")
         sys.exit(1)
 
-    ofs = 17
+    ofs = 8
     publickey = packet[ofs:ofs+65]
     ofs += 65
     rp_len = packet[ofs]
@@ -339,7 +335,7 @@ def sign(file, output, seckey: str):
     timestamp = int(time.time())
 
     # Build the signature packet
-    packet = b'\x04\x00\x1d\x08'
+    packet = b'\x04\x00\x2b\x08'
     packet += b'\x00\x06'
     # Creation timestamp (hashed)
     packet += b'\x05\x02' + int2bytes(timestamp, 4)
@@ -383,14 +379,11 @@ def verify(file, signature, pubkey: str):
     if packet[0] != 4:
         print("We only understand v4 keys")
         sys.exit(1)
-    if packet[5] != 0x1D:
-        print("We only understand SK-ECDSA keys")
-        sys.exit(1)
-    if packet[6] != 8:
-        print("OID is wrong length")
+    if packet[5] != 43:
+        print("We only understand SK-NISTP256 keys")
         sys.exit(1)
 
-    ofs = 17
+    ofs = 8
     publickey = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(),
                                                              packet[ofs:ofs+65])
     ofs += 65
@@ -416,8 +409,8 @@ def verify(file, signature, pubkey: str):
         print("We can only verify signatures over binary data")
         sys.exit(1)
 
-    if packet[2] != 0x1D:
-        print("We can only verify signatures from SK-ECDSA keys")
+    if packet[2] != 43:
+        print("We can only verify signatures from SK-NISTP256 keys")
         sys.exit(1)
 
     if packet[3] != 8:
