@@ -277,7 +277,7 @@ def genkey(rp, uid, pubkey, seckey: str):
     packets.append(packet)
 
     print()
-    print("Generated key with fingerprint:", m.hexdigest())
+    print("Generated key with fingerprint:", m.hexdigest().upper())
     with open(pubkey, "wb") as f:
         for packet in packets:
             f.write(packet)
@@ -472,9 +472,9 @@ def verify(file, signature, pubkey: str):
         pass
 
     if sig_ok:
-        print("GOOD signature from", fingerprint)
+        print("GOOD signature from", fingerprint.upper())
     else:
-        print("BAD signature from", fingerprint)
+        print("BAD signature from", fingerprint.upper())
 
 
 if __name__ == '__main__':
