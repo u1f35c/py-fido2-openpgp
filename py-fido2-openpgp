@@ -191,8 +191,6 @@ def genkey(rp, uid, pubkey, seckey: str):
         user, user_verification="discouraged", authenticator_attachment="cross-platform"
     )
 
-    print(create_options)
-
     print("Generating key")
     result = client.make_credential(create_options["publicKey"])
     auth_data = server.register_complete(
@@ -258,8 +256,6 @@ def genkey(rp, uid, pubkey, seckey: str):
     sigdata += b'\xB4' + int2bytes(len(uid_bytes), 4) + uid_bytes
     sigdata += packet
     sigdata += b'\x04\xFF' + int2bytes(len(packet), 4)
-
-    print("Signature hash over: ", base64.b64encode(sigdata))
 
     sigobj = sha256(sigdata)
 
