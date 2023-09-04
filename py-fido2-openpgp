@@ -289,8 +289,9 @@ def genkey(rp, uid, pubkey, seckey: str):
 @cli.command()
 @click.option("--file", required=bool, help="File to sign")
 @click.option("--output", required=bool, help="File to store signature in")
+@click.option("--text", is_flag=True, default=False, help="Produce a text document signature")
 @click.option("--seckey", default="fido2-sec.pgp", help="File to read secret key from")
-def sign(file, output, seckey: str):
+def sign(file, output, seckey: str, text: bool):
     """Reads a file and produces a detached signature over it
     """
 
@@ -301,6 +302,8 @@ def sign(file, output, seckey: str):
             data = f.read(4096)
             if not data:
                 break
+            if text:
+                data = data.replace(b'\n', b'\r\n')
             hasher.update(data)
 
     # Read the secret key data
@@ -335,7 +338,12 @@ def sign(file, output, seckey: str):
     timestamp = int(time.time())
 
     # Build the signature packet
-    packet = b'\x04\x00\x2b\x08'
+    packet = b'\x04'
+    if text:
+        packet += b'\x01'
+    else:
+        packet += b'\x00'
+    packet += b'\x2b\x08'
     packet += b'\x00\x06'
     # Creation timestamp (hashed)
     packet += b'\x05\x02' + int2bytes(timestamp, 4)
@@ -405,9 +413,10 @@ def verify(file, signature, pubkey: str):
         print("We only understand v4 keys")
         sys.exit(1)
 
-    if packet[1] != 0:
-        print("We can only verify signatures over binary data")
+    if packet[1] != 0 and packet[1] != 1:
+        print("We can only verify signatures over binary or text data")
         sys.exit(1)
+    text = (packet[1] == 1)
 
     if packet[2] != 43:
         print("We can only verify signatures from SK-NISTP256 keys")
@@ -426,6 +435,8 @@ def verify(file, signature, pubkey: str):
             data = f.read(4096)
             if not data:
                 break
+            if text:
+                data = data.replace(b'\n', b'\r\n')
             hasher.update(data)
 
     hasher.update(packet[:length] + b'\x04\xFF' + int2bytes(length, 4))
